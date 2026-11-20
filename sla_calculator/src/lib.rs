@@ -14,6 +14,12 @@ mod tests;
 #[cfg(test)]
 mod batch_downtime_tests;
 
+#[cfg(test)]
+mod batch_test;
+
+#[cfg(test)]
+mod proptests;
+
 pub mod adaptive_tuning;
 pub mod admin_query;
 pub mod admin_transfer;
@@ -22,6 +28,7 @@ pub mod storage_version;
 pub mod submission_rate;
 pub mod symbol_constants;
 pub mod batch;
+pub mod batch_optimized;
 pub mod breach_escalation;
 pub mod claim_deadline;
 pub mod unpause;
@@ -1353,6 +1360,7 @@ impl SLACalculatorContract {
         Self::check_version(&env)?;
         // Validate batch inputs before processing
         crate::batch::validate_batch(&env, &requests)?;
+        crate::batch::validate_xdr_budget(&env, &requests)?;
 
         // Bypass all authorization and pause checks to allow public verification
         let configs: soroban_sdk::Map<Symbol, SLAConfig> = env
