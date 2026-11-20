@@ -2315,6 +2315,47 @@ fn test_get_pending_admin_none_when_no_proposal() {
     assert_eq!(client.get_pending_admin(), None);
 }
 
+#[test]
+fn test_admin_transfer_acceptance_uses_latest_pending_and_names_both_admins() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let cid = env.register_contract(None, SLACalculatorContract);
+    let admin = soroban_sdk::Address::generate(&env);
+    let superseded = soroban_sdk::Address::generate(&env);
+    let latest = soroban_sdk::Address::generate(&env);
+
+    env.as_contract(&cid, || {
+        env.storage().instance().set(&ADMIN_KEY, &admin);
+        crate::admin_transfer::propose_admin(&env, &admin, superseded.clone());
+        crate::admin_transfer::propose_admin(&env, &admin, latest.clone());
+
+        assert_eq!(
+            crate::admin_transfer::accept_admin(&env, &superseded),
+            Err(crate::admin_transfer::AdminTransferError::NotPendingAdmin)
+        );
+        assert_eq!(crate::admin_transfer::accept_admin(&env, &latest), Ok(()));
+
+        let stored: soroban_sdk::Address = env.storage().instance().get(&ADMIN_KEY).unwrap();
+        assert_eq!(stored, latest);
+    });
+
+    let events = env.events().all();
+    let mut accepted = None;
+    for i in 0..events.len() {
+        let (_, topics, data) = events.get(i).unwrap();
+        let topic: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        if topic == symbol_short!("adm_acpt") {
+            accepted = Some(data);
+        }
+    }
+    let (old_admin, new_admin): (soroban_sdk::Address, soroban_sdk::Address) = accepted
+        .expect("acceptance event emitted")
+        .try_into_val(&env)
+        .unwrap();
+    assert_eq!(old_admin, admin);
+    assert_eq!(new_admin, latest);
+}
+
 // ============================================================
 // #64 – Two-step operator handoff
 // ============================================================
@@ -2466,6 +2507,58 @@ fn test_admin_can_renounce() {
     let (_env, client, actors) = setup();
     client.renounce_admin(&actors.admin);
     // After renounce, admin-gated calls must fail
+}
+
+#[test]
+fn test_renounce_is_irreversible_and_event_matches_stored_state() {
+    let (env, client, actors) = setup();
+    client.renounce_admin(&actors.admin);
+
+    assert_eq!(
+        client
+            .try_renounce_admin(&actors.admin)
+            .unwrap_err()
+            .unwrap(),
+        SLAError::Unauthorized
+    );
+    assert_eq!(
+        client
+            .try_propose_admin(&actors.admin, &actors.stranger)
+            .unwrap_err()
+            .unwrap(),
+        SLAError::Unauthorized
+    );
+    assert_eq!(
+        client
+            .try_set_config(
+                &actors.admin,
+                &symbol_short!("critical"),
+                &20,
+                &200,
+                &1000,
+                &200,
+                &150,
+                &100,
+            )
+            .unwrap_err()
+            .unwrap(),
+        SLAError::Unauthorized
+    );
+    assert_eq!(
+        client.try_get_admin().unwrap_err().unwrap(),
+        SLAError::NotInitialized
+    );
+
+    let events = env.events().all();
+    let mut emitter: Option<soroban_sdk::Address> = None;
+    for i in 0..events.len() {
+        let (_, topics, _) = events.get(i).unwrap();
+        let topic: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        if topic == symbol_short!("adm_ren") {
+            emitter = Some(topics.get(2).unwrap().try_into_val(&env).unwrap());
+        }
+    }
+    assert_eq!(emitter, Some(actors.admin));
 }
 
 #[test]
