@@ -10,6 +10,9 @@ use soroban_sdk::testutils::Events as _;
 use soroban_sdk::testutils::Ledger as _;
 use soroban_sdk::{Env, Symbol, TryIntoVal, Vec};
 
+mod batch_memory_test;
+mod batch_xdr_test;
+
 // ============================================================
 // Test helpers
 // ============================================================
