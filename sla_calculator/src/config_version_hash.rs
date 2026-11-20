@@ -1,5 +1,5 @@
 // Configuration version hash tracking. Complements config_bundle.rs.
-use soroban_sdk::{Bytes, BytesN, Env};
+use soroban_sdk::{contracttype, symbol_short, Bytes, BytesN, Env, Symbol};
 
 /// Computes the SHA256 version hash of the active configuration bytes
 /// (caller serializes the SLA threshold parameters into `config_bytes`).
@@ -11,6 +11,29 @@ pub fn compute_config_version_hash(env: &Env, config_bytes: &Bytes) -> BytesN<32
 /// given serialized config snapshot.
 pub fn get_config_version_hash(env: &Env, config_bytes: &Bytes) -> BytesN<32> {
     compute_config_version_hash(env, config_bytes)
+}
+
+pub const CONFIG_REVISION_KEY: Symbol = symbol_short!("CFGREV");
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConfigRevisionSnapshot {
+    pub revision: u64,
+    pub digest: BytesN<32>,
+}
+
+pub fn config_revision_digest(env: &Env, config_bytes: &Bytes) -> BytesN<32> {
+    compute_config_version_hash(env, config_bytes)
+}
+
+pub fn write_config_revision(env: &Env, revision: u64, digest: &BytesN<32>) {
+    env.storage().instance().set(
+        &CONFIG_REVISION_KEY,
+        &ConfigRevisionSnapshot {
+            revision,
+            digest: digest.clone(),
+        },
+    );
 }
 
 /// #1021 — outcome of two interleaved revision computations.

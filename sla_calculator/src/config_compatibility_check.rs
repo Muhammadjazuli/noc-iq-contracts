@@ -1,6 +1,7 @@
 // Config version negotiation query for client SDKs. Complements
 // version_negotiation.rs.
-use soroban_sdk::{contracttype, Env, Symbol, Vec};
+use crate::{SLAConfig, SLAConfigEntry};
+use soroban_sdk::{contracttype, symbol_short, Symbol, Vec};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[contracttype]
@@ -11,37 +12,16 @@ pub enum CompatibilityStatus {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[contracttype]
-pub enum CompatibilityCategory {
-    Compatible,
-    OptionalAddition,
-    BreakingAddition,
-    BreakingRemoval,
-    IncompatibleType,
+pub enum ConfigInvariantError {
+    InvalidSeverity(Symbol),
+    DuplicateSeverity(Symbol),
+    MissingSeverity(Symbol),
+    ThresholdOrder(Symbol),
+    PenaltyOrder(Symbol),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[contracttype]
-pub struct ConfigFieldSchema {
-    pub path: Symbol,
-    pub field_type: Symbol,
-    pub required: bool,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[contracttype]
-pub struct ConfigSchema {
-    pub fields: Vec<ConfigFieldSchema>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[contracttype]
-pub struct ConfigCompatibilityResult {
-    pub compatible: bool,
-    pub category: CompatibilityCategory,
-    pub field_path: Option<Symbol>,
-}
-
+/// Compares the active contract config version against a client's
+/// reported version to determine compatibility status.
 pub fn check_config_compatibility(
     active_version: u32,
     client_version: u32,
@@ -55,153 +35,124 @@ pub fn check_config_compatibility(
     }
 }
 
-pub fn check_schema_compatibility(
-    baseline: &ConfigSchema,
-    candidate: &ConfigSchema,
-) -> ConfigCompatibilityResult {
-    for i in 0..baseline.fields.len() {
-        let old = baseline.fields.get(i).unwrap();
-        match find_field(&candidate.fields, &old.path) {
-            None if old.required => {
-                return result(false, CompatibilityCategory::BreakingRemoval, Some(old.path));
-            }
-            None => {}
-            Some(new) if new.field_type != old.field_type => {
-                return result(
-                    false,
-                    CompatibilityCategory::IncompatibleType,
-                    Some(old.path),
-                );
-            }
-            Some(_) => {}
-        }
+fn severity_index(severity: &Symbol) -> Option<usize> {
+    if *severity == symbol_short!("critical") {
+        Some(0)
+    } else if *severity == symbol_short!("high") {
+        Some(1)
+    } else if *severity == symbol_short!("medium") {
+        Some(2)
+    } else if *severity == symbol_short!("low") {
+        Some(3)
+    } else {
+        None
     }
-
-    for i in 0..candidate.fields.len() {
-        let new = candidate.fields.get(i).unwrap();
-        if find_field(&baseline.fields, &new.path).is_none() {
-            let (compatible, category) = if new.required {
-                (false, CompatibilityCategory::BreakingAddition)
-            } else {
-                (true, CompatibilityCategory::OptionalAddition)
-            };
-            return result(compatible, category, Some(new.path));
-        }
-    }
-
-    result(true, CompatibilityCategory::Compatible, None)
 }
 
-fn find_field(fields: &Vec<ConfigFieldSchema>, path: &Symbol) -> Option<ConfigFieldSchema> {
-    for i in 0..fields.len() {
-        let field = fields.get(i).unwrap();
-        if field.path == *path {
-            return Some(field);
+pub fn validate_cross_severity_invariants(
+    entries: &Vec<SLAConfigEntry>,
+) -> Result<(), ConfigInvariantError> {
+    let canonical = [
+        symbol_short!("critical"),
+        symbol_short!("high"),
+        symbol_short!("medium"),
+        symbol_short!("low"),
+    ];
+    let mut ordered: [Option<&SLAConfig>; 4] = [None, None, None, None];
+
+    for entry in entries.iter() {
+        let index = severity_index(&entry.severity)
+            .ok_or_else(|| ConfigInvariantError::InvalidSeverity(entry.severity.clone()))?;
+        if ordered[index].is_some() {
+            return Err(ConfigInvariantError::DuplicateSeverity(
+                entry.severity.clone(),
+            ));
+        }
+        ordered[index] = Some(&entry.config);
+    }
+
+    for (index, severity) in canonical.iter().enumerate() {
+        if ordered[index].is_none() {
+            return Err(ConfigInvariantError::MissingSeverity(severity.clone()));
         }
     }
-    None
-}
 
-fn result(
-    compatible: bool,
-    category: CompatibilityCategory,
-    field_path: Option<Symbol>,
-) -> ConfigCompatibilityResult {
-    ConfigCompatibilityResult {
-        compatible,
-        category,
-        field_path,
+    for index in 1..canonical.len() {
+        let higher = ordered[index - 1].unwrap();
+        let lower = ordered[index].unwrap();
+        if higher.threshold_minutes >= lower.threshold_minutes {
+            return Err(ConfigInvariantError::ThresholdOrder(
+                canonical[index].clone(),
+            ));
+        }
+        if higher.penalty_per_minute <= lower.penalty_per_minute {
+            return Err(ConfigInvariantError::PenaltyOrder(canonical[index].clone()));
+        }
     }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use soroban_sdk::Env;
 
-    fn field(env: &Env, path: &str, field_type: &str, required: bool) -> ConfigFieldSchema {
-        ConfigFieldSchema {
-            path: Symbol::new(env, path),
-            field_type: Symbol::new(env, field_type),
-            required,
+    fn entry(severity: Symbol, threshold_minutes: u32, penalty_per_minute: i128) -> SLAConfigEntry {
+        SLAConfigEntry {
+            severity,
+            config: SLAConfig {
+                threshold_minutes,
+                penalty_per_minute,
+                reward_base: 500,
+                top_tier_multiplier: 200,
+                excel_tier_multiplier: 150,
+                good_tier_multiplier: 100,
+            },
         }
-    }
-
-    fn schema(env: &Env, fields: &[ConfigFieldSchema]) -> ConfigSchema {
-        let mut stored = Vec::new(env);
-        for field in fields {
-            stored.push_back(field.clone());
-        }
-        ConfigSchema { fields: stored }
     }
 
     #[test]
-    fn version_gap_still_reports_upgrade_recommended() {
+    fn ordered_bundle_satisfies_cross_severity_invariants() {
+        let env = Env::default();
+        let entries = soroban_sdk::vec![
+            &env,
+            entry(symbol_short!("critical"), 15, 100),
+            entry(symbol_short!("high"), 30, 50),
+            entry(symbol_short!("medium"), 60, 20),
+            entry(symbol_short!("low"), 120, 5),
+        ];
+        assert_eq!(validate_cross_severity_invariants(&entries), Ok(()));
+    }
+
+    #[test]
+    fn inverted_threshold_is_rejected_before_application() {
+        let env = Env::default();
+        let entries = soroban_sdk::vec![
+            &env,
+            entry(symbol_short!("critical"), 60, 100),
+            entry(symbol_short!("high"), 30, 50),
+            entry(symbol_short!("medium"), 90, 20),
+            entry(symbol_short!("low"), 120, 5),
+        ];
         assert_eq!(
-            check_config_compatibility(3, 2),
-            CompatibilityStatus::UpgradeRecommended
+            validate_cross_severity_invariants(&entries),
+            Err(ConfigInvariantError::ThresholdOrder(symbol_short!("high")))
         );
     }
 
     #[test]
-    fn adding_an_optional_field_is_classified_as_optional_addition() {
+    fn inverted_penalty_is_rejected_before_application() {
         let env = Env::default();
-        let baseline = schema(&env, &[field(&env, "threshold", "u32", true)]);
-        let candidate = schema(
+        let entries = soroban_sdk::vec![
             &env,
-            &[
-                field(&env, "threshold", "u32", true),
-                field(&env, "note", "string", false),
-            ],
+            entry(symbol_short!("critical"), 15, 10),
+            entry(symbol_short!("high"), 30, 50),
+            entry(symbol_short!("medium"), 60, 20),
+            entry(symbol_short!("low"), 120, 5),
+        ];
+        assert_eq!(
+            validate_cross_severity_invariants(&entries),
+            Err(ConfigInvariantError::PenaltyOrder(symbol_short!("high")))
         );
-
-        let result = check_schema_compatibility(&baseline, &candidate);
-
-        assert!(result.compatible);
-        assert_eq!(result.category, CompatibilityCategory::OptionalAddition);
-        assert_eq!(result.field_path, Some(Symbol::new(&env, "note")));
-    }
-
-    #[test]
-    fn removing_a_required_field_is_classified_as_breaking_removal() {
-        let env = Env::default();
-        let baseline = schema(
-            &env,
-            &[
-                field(&env, "threshold", "u32", true),
-                field(&env, "penalty", "i128", true),
-            ],
-        );
-        let candidate = schema(&env, &[field(&env, "threshold", "u32", true)]);
-
-        let result = check_schema_compatibility(&baseline, &candidate);
-
-        assert!(!result.compatible);
-        assert_eq!(result.category, CompatibilityCategory::BreakingRemoval);
-        assert_eq!(result.field_path, Some(Symbol::new(&env, "penalty")));
-    }
-
-    #[test]
-    fn changing_a_field_type_is_classified_as_incompatible_type() {
-        let env = Env::default();
-        let baseline = schema(&env, &[field(&env, "threshold", "u32", true)]);
-        let candidate = schema(&env, &[field(&env, "threshold", "i128", true)]);
-
-        let result = check_schema_compatibility(&baseline, &candidate);
-
-        assert!(!result.compatible);
-        assert_eq!(result.category, CompatibilityCategory::IncompatibleType);
-        assert_eq!(result.field_path, Some(Symbol::new(&env, "threshold")));
-    }
-
-    #[test]
-    fn identical_schemas_are_compatible_without_a_field_path() {
-        let env = Env::default();
-        let baseline = schema(&env, &[field(&env, "threshold", "u32", true)]);
-
-        let result = check_schema_compatibility(&baseline, &baseline);
-
-        assert!(result.compatible);
-        assert_eq!(result.category, CompatibilityCategory::Compatible);
-        assert_eq!(result.field_path, None);
     }
 }
